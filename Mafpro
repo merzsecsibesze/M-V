@@ -1,0 +1,584 @@
+
+// ==UserScript==
+// @name         Magyar Maffia - Top 20 védettség nélkül
+// @namespace    magyarmaffia.top20
+// @version      3.0
+// @description  A leggazdagabb, védettség nélküli játékosok keresése.
+// @match        https://s1.magyarmaffia.hu/*
+// @grant        none
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  if (window.__mmTop20Installed) return;
+  window.__mmTop20Installed = true;
+
+  const BASE = location.origin;
+  const RANK_URL =
+    '/hallOfFame/players?sort=money&direction=desc';
+
+  const TARGET_COUNT = 20;
+  const MAX_PAGES = 100;
+  const BATCH_SIZE = 5;
+
+  const sleep = ms =>
+    new Promise(resolve => setTimeout(resolve, ms));
+
+  // ---------- PANEL ----------
+
+  const panel = document.createElement('div');
+  Object.assign(panel.style, {
+    position: 'fixed',
+    right: '18px',
+    bottom: '18px',
+    width: '440px',
+    maxWidth: 'calc(100vw - 36px)',
+    maxHeight: '75vh',
+    overflowY: 'auto',
+    zIndex: '999999',
+    boxSizing: 'border-box',
+    background: '#171b22',
+    color: '#f2f2f2',
+    border: '1px solid #8b743d',
+    borderRadius: '10px',
+    padding: '12px',
+    boxShadow: '0 5px 25px #0009',
+    font: '13px Arial, sans-serif'
+  });
+
+  const heading = document.createElement('div');
+  heading.textContent = 'Magyar Maffia – Top 20';
+  heading.style.cssText =
+    'font-size:16px;font-weight:bold;margin-bottom:10px';
+
+  const refresh = document.createElement('button');
+  refresh.textContent = 'Frissítés';
+  refresh.style.cssText =
+    'padding:8px 12px;margin-right:8px;cursor:pointer;font-weight:bold';
+
+  const hide = document.createElement('button');
+  hide.textContent = 'Elrejt';
+  hide.style.cssText = 'padding:8px 12px;cursor:pointer';
+
+  const status = document.createElement('div');
+  status.style.cssText =
+    'margin:10px 0;color:#e3ce91;line-height:1.5;overflow-wrap:anywhere';
+
+  const results = document.createElement('div');
+
+  panel.append(heading, refresh, hide, status, results);
+  document.body.appendChild(panel);
+
+  const reopen = document.createElement('button');
+  reopen.textContent = 'Top 20 megnyitása';
+  Object.assign(reopen.style, {
+    display: 'none',
+    position: 'fixed',
+    right: '18px',
+    bottom: '18px',
+    zIndex: '999999',
+    padding: '10px',
+    cursor: 'pointer'
+  });
+  document.body.appendChild(reopen);
+
+  hide.addEventListener('click', () => {
+    panel.style.display = 'none';
+    reopen.style.display = 'block';
+  });
+
+  reopen.addEventListener('click', () => {
+    panel.style.display = 'block';
+    reopen.style.display = 'none';
+  });
+
+  // ---------- HÁTTÉRLEKÉRÉSEK ----------
+
+  async function fetchText(url) {
+    const response = await fetch(url, {
+      credentials: 'same-origin',
+      headers: {
+        'X-Requested-With': 'XMLHttpRequest'
+      }
+    });
+
+    const text = await response.text();
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${url}`);
+    }
+
+    return { text, url: response.url };
+  }
+
+  async function getDocument(url) {
+    const result = await fetchText(url);
+
+    return {
+      ...result,
+      doc: new DOMParser().parseFromString(
+        result.text,
+        'text/html'
+      )
+    };
+  }
+
+  // A lapozás válasza lehet HTML-részlet vagy JSON-ba csomagolt HTML.
+  async function getLoadMorePlayers(url) {
+    const result = await fetchText(url);
+    const raw = result.text;
+    let html = raw;
+
+    try {
+      const data = JSON.parse(raw);
+
+      if (typeof data === 'string') {
+        html = data;
+      } else if (data && typeof data === 'object') {
+        const candidates = [
+          data.html,
+          data.content,
+          data.data,
+          data.view,
+          data.results
+        ];
+
+        const candidate = candidates.find(
+          value => typeof value === 'string' &&
+            /<|players-list-rows|result-user-i/i.test(value)
+        );
+
+        if (candidate) {
+          html = candidate;
+        } else {
+          console.warn(
+            '[MM Top20] Ismeretlen JSON-válasz:',
+            data
+          );
+        }
+      }
+    } catch (_) {
+      // A válasz nem JSON; HTML-ként próbáljuk feldolgozni.
+    }
+
+    const doc = new DOMParser().parseFromString(
+      html,
+      'text/html'
+    );
+
+    console.log(
+      '[MM Top20] Lapozási válasz:',
+      raw.slice(0, 800)
+    );
+
+    return { doc, html, raw, url: result.url };
+  }
+
+  // ---------- ADATFELDOLGOZÁS ----------
+
+  function parseMoney(text) {
+    const cleaned = String(text || '')
+      .replace(/\s/g, '')
+      .replace(/Ft/gi, '')
+      .replace(/[^\d.,-]/g, '')
+      .replace(/,(?=\d{1,2}$)/, '.');
+
+    const value = Number(cleaned);
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  function extractMoney(row) {
+    const items = [...row.querySelectorAll('.details .item')];
+
+    const item = items.find(el =>
+      /pénztárcában/i.test(el.textContent || '')
+    );
+
+    if (!item) return '';
+
+    const value = item.querySelector('.value');
+
+    if (value) return value.textContent.trim();
+
+    return (item.textContent || '')
+      .replace(/A pénztárcában\s*:?/i, '')
+      .trim();
+  }
+
+  function readPlayers(doc) {
+    let rows = [
+      ...doc.querySelectorAll(
+        '#players-list-rows .result-user-i'
+      )
+    ];
+
+    if (!rows.length) {
+      rows = [
+        ...doc.querySelectorAll('.result-user-i.box-ins')
+      ];
+    }
+
+    // Egyes AJAX-válaszok csak a sorokat tartalmazzák.
+    if (!rows.length) {
+      rows = [
+        ...doc.querySelectorAll('.result-user-i')
+      ];
+    }
+
+    const players = rows.map(row => {
+      const link =
+        row.querySelector('.name a[href*="/profile/"]') ||
+        row.querySelector('a[href*="/profile/"]');
+
+      if (!link) return null;
+
+      const match = (link.getAttribute('href') || '')
+        .match(/\/profile\/(\d+)/);
+
+      if (!match) return null;
+
+      const moneyText = extractMoney(row);
+
+      return {
+        id: match[1],
+        name: link.textContent.trim(),
+        profilePath: `/profile/${match[1]}`,
+        moneyText,
+        money: parseMoney(moneyText),
+        level:
+          row.querySelector('.level')?.textContent.trim() || '?'
+      };
+    }).filter(Boolean);
+
+    console.log(
+      '[MM Top20] Ranglistasorok:',
+      rows.length,
+      '| Felismert játékosok:',
+      players.length
+    );
+
+    if (players.length) {
+      console.log(
+        '[MM Top20] Első három játékos:',
+        players.slice(0, 3)
+      );
+    }
+
+    return players;
+  }
+
+  // ---------- VÉDETTSÉG ----------
+
+  async function checkShield(player) {
+    try {
+      const result = await getDocument(
+        `${player.profilePath}/info`
+      );
+
+      const doc = result.doc;
+
+      let text = [...doc.querySelectorAll('.personal-info')]
+        .map(el => el.textContent || '')
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (!/védettség\s*:/i.test(text)) {
+        text = (doc.body?.textContent || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+
+      const index = text.toLowerCase().lastIndexOf('védettség:');
+
+      if (index < 0) {
+        console.warn(
+          '[MM Top20] Nem található védettségi mező:',
+          player.name,
+          'URL:',
+          result.url,
+          'HTML:',
+          result.text.slice(0, 500)
+        );
+        return 'unknown';
+      }
+
+      const value = text
+        .slice(index + 'védettség:'.length)
+        .trim();
+
+      console.log(
+        '[MM Top20] Védettség:',
+        player.name,
+        '=>',
+        value.slice(0, 100)
+      );
+
+      if (/^nincs(?:\s|$)/i.test(value)) {
+        return 'none';
+      }
+
+      if (value) return 'shielded';
+
+      return 'unknown';
+    } catch (error) {
+      console.error(
+        '[MM Top20] Profillekérési hiba:',
+        player.name,
+        error
+      );
+      return 'unknown';
+    }
+  }
+
+  // ---------- MEGJELENÍTÉS ----------
+
+  function renderPlayers(players) {
+    results.replaceChildren();
+
+    if (!players.length) {
+      const empty = document.createElement('div');
+      empty.textContent = 'Még nincs találat.';
+      results.appendChild(empty);
+      return;
+    }
+
+    const table = document.createElement('table');
+    table.style.cssText =
+      'width:100%;border-collapse:collapse;margin-top:8px';
+
+    const header = document.createElement('tr');
+
+    ['#', 'Játékos', 'Szint', 'Pénztárca'].forEach(label => {
+      const th = document.createElement('th');
+      th.textContent = label;
+      th.style.cssText =
+        'text-align:left;padding:6px 4px;border-bottom:1px solid #665b42';
+      header.appendChild(th);
+    });
+
+    table.appendChild(header);
+
+    players.forEach((player, index) => {
+      const tr = document.createElement('tr');
+
+      const rank = document.createElement('td');
+      rank.textContent = String(index + 1);
+
+      const nameCell = document.createElement('td');
+      const link = document.createElement('a');
+      link.textContent = player.name;
+      link.href = `${BASE}${player.profilePath}`;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.style.color = '#e7c76c';
+      nameCell.appendChild(link);
+
+      const level = document.createElement('td');
+      level.textContent = player.level;
+
+      const money = document.createElement('td');
+      money.textContent = player.moneyText || '—';
+      money.style.textAlign = 'right';
+
+      [rank, nameCell, level, money].forEach(cell => {
+        cell.style.cssText +=
+          ';padding:7px 4px;border-bottom:1px solid #343943';
+        tr.appendChild(cell);
+      });
+
+      table.appendChild(tr);
+    });
+
+    results.appendChild(table);
+  }
+
+  // ---------- KERESÉS ----------
+
+  let running = false;
+
+  async function runSearch() {
+    if (running) return;
+    running = true;
+
+    refresh.disabled = true;
+    refresh.textContent = 'Keresés…';
+    results.replaceChildren();
+
+    let checked = 0;
+    let unknown = 0;
+    const found = [];
+    const seen = new Set();
+
+    try {
+      status.textContent = 'Ranglista betöltése…';
+
+      const first = await getDocument(RANK_URL);
+      let players = readPlayers(first.doc);
+
+      if (!players.length) {
+        console.error(
+          '[MM Top20] Ranglista HTML:',
+          first.text.slice(0, 1500)
+        );
+        throw new Error(
+          'Nem sikerült kiolvasni a ranglistát. Nézd meg a Console naplóját.'
+        );
+      }
+
+      let pagination =
+        first.doc.querySelector('.load-more-container');
+
+      let endpoint =
+        pagination?.getAttribute('data-load-more-url') || '';
+
+      let paramsText =
+        pagination?.getAttribute('data-load-more-params') || '';
+
+      let nextPage = Number(
+        pagination?.getAttribute('data-load-more-page') || 2
+      );
+
+      for (let pageNo = 1; pageNo <= MAX_PAGES; pageNo++) {
+        const fresh = players.filter(player => {
+          if (seen.has(player.id)) return false;
+          seen.add(player.id);
+          return true;
+        });
+
+        for (let i = 0; i < fresh.length; i += BATCH_SIZE) {
+          const batch = fresh.slice(i, i + BATCH_SIZE);
+
+          status.textContent =
+            `Profilok ellenőrzése: ${checked}; ` +
+            `találatok: ${found.length}/${TARGET_COUNT}`;
+
+          const states = await Promise.all(
+            batch.map(player => checkShield(player))
+          );
+
+          for (let j = 0; j < batch.length; j++) {
+            checked++;
+
+            if (states[j] === 'none') {
+              found.push(batch[j]);
+            } else if (states[j] === 'unknown') {
+              unknown++;
+            }
+
+            if (found.length >= TARGET_COUNT) break;
+          }
+
+          renderPlayers(found);
+
+          status.textContent =
+            `Ellenőrizve: ${checked} · ` +
+            `Találat: ${found.length}/${TARGET_COUNT} · ` +
+            `Nem olvasható: ${unknown}`;
+
+          if (found.length >= TARGET_COUNT) break;
+
+          await sleep(150);
+        }
+
+        if (found.length >= TARGET_COUNT) break;
+        if (!endpoint) {
+          console.warn(
+            '[MM Top20] Nincs lapozási végpont a ranglistában.'
+          );
+          break;
+        }
+
+        const url = new URL(endpoint, BASE);
+        const params = new URLSearchParams(paramsText);
+
+        params.set('page', String(nextPage));
+        url.search = params.toString();
+
+        console.log(
+          '[MM Top20] Lapozási kérés:',
+          url.href
+        );
+
+        const next = await getLoadMorePlayers(url.href);
+        const nextPlayers = readPlayers(next.doc);
+
+        if (!nextPlayers.length) {
+          console.warn(
+            '[MM Top20] A lapozási válaszból nem sikerült játékosokat kiolvasni.',
+            'Válasz URL:',
+            next.url,
+            'Válasz eleje:',
+            next.raw.slice(0, 1500)
+          );
+
+          status.textContent =
+            `A lapozás megállt a ${pageNo}. oldal után. ` +
+            `${found.length} találat; ${checked} profil ellenőrizve. ` +
+            'A Console tartalmazza a lapozási választ.';
+          break;
+        }
+
+        players = nextPlayers;
+
+        const newPagination =
+          next.doc.querySelector('.load-more-container');
+
+        if (newPagination) {
+          endpoint =
+            newPagination.getAttribute('data-load-more-url') ||
+            endpoint;
+
+          paramsText =
+            newPagination.getAttribute('data-load-more-params') ||
+            paramsText;
+
+          const advertisedPage = Number(
+            newPagination.getAttribute('data-load-more-page')
+          );
+
+          nextPage = advertisedPage > nextPage
+            ? advertisedPage
+            : nextPage + 1;
+        } else {
+          nextPage++;
+        }
+
+        await sleep(200);
+      }
+
+      renderPlayers(found);
+
+      if (found.length >= TARGET_COUNT) {
+        status.textContent =
+          `Kész: ${found.length} játékos. ` +
+          `Ellenőrizve: ${checked}; nem olvasható: ${unknown}.`;
+      } else if (found.length > 0) {
+        status.textContent =
+          `Találatok: ${found.length}. ` +
+          `Ellenőrizve: ${checked}; nem olvasható: ${unknown}.`;
+      } else if (status.textContent.includes('lapozás megállt')) {
+        // A részletes lapozási hibaüzenet maradjon látható.
+      } else {
+        status.textContent =
+          `Nincs találat. Ellenőrizve: ${checked}; ` +
+          `nem olvasható: ${unknown}. Nézd meg a Console naplóját.`;
+      }
+    } catch (error) {
+      console.error('[MM Top20] Keresési hiba:', error);
+      status.textContent = `Hiba: ${error.message}`;
+    } finally {
+      refresh.disabled = false;
+      refresh.textContent = 'Frissítés';
+      running = false;
+    }
+  }
+
+  refresh.addEventListener('click', runSearch);
+
+  status.textContent =
+    'Kattints a Frissítés gombra a keresés indításához.';
+
+  renderPlayers([]);
+})();
